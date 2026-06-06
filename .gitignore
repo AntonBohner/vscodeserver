@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# editor
+.vscode/
+.idea/
+
+# logs/temp
+*.log
+*.tmp
+
+# local config
+.env
+.env.*

@@ -1,0 +1,253 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+CONFIG_FILE="${VSCODE_SERVER_CONFIG:-$HOME/.config/vscodeserver/config}"
+
+# Built-in defaults. User config may override these.
+SESSION="vscode-server"
+PORT="8001"
+TAILSCALE_BIN="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+DEV_LINK_DEFAULT="$HOME/dev"
+DEV_ROOT_FALLBACK="${VSCODE_SERVER_DEV_ROOT:-}"
+
+if [[ -d "$DEV_LINK_DEFAULT" ]]; then
+  DEFAULT_FOLDER="$DEV_LINK_DEFAULT"
+elif [[ -n "$DEV_ROOT_FALLBACK" && -d "$DEV_ROOT_FALLBACK" ]]; then
+  DEFAULT_FOLDER="$DEV_ROOT_FALLBACK"
+else
+  DEFAULT_FOLDER="$HOME"
+fi
+
+# Optional user config. Expected variables:
+#   DEFAULT_FOLDER, PORT, SESSION, TAILSCALE_BIN
+if [[ -f "$CONFIG_FILE" ]]; then
+  source "$CONFIG_FILE"
+fi
+
+# Environment overrides config for one-off runs.
+SESSION="${VSCODE_SERVER_SESSION:-$SESSION}"
+PORT="${VSCODE_SERVER_PORT:-$PORT}"
+DEFAULT_FOLDER="${VSCODE_SERVER_FOLDER:-$DEFAULT_FOLDER}"
+
+usage() {
+  cat <<'EOF'
+vscodeserver - VS Code Web over Tailscale in tmux
+
+Usage:
+  vscodeserver start [folder]    start VS Code Web in tmux
+  vscodeserver stop              stop VS Code Web/tmux session
+  vscodeserver restart [folder]  stop then start
+  vscodeserver status            show URL, port, tmux/process status
+  vscodeserver url               print the browser URL only
+  vscodeserver attach            attach to tmux session
+  vscodeserver logs              show recent tmux output
+  vscodeserver config            show config file and effective defaults
+  vscodeserver help              show this help
+
+Default:
+  host:   Mac Tailscale IP only
+  port:   8001
+  auth:   no VS Code token, because access is Tailnet-only
+  folder: from config DEFAULT_FOLDER; built-in fallback is ~/dev, VSCODE_SERVER_DEV_ROOT, then $HOME
+EOF
+}
+
+code_bin() {
+  if command -v code >/dev/null 2>&1; then
+    command -v code
+  elif [[ -x "/usr/local/bin/code" ]]; then
+    echo "/usr/local/bin/code"
+  elif [[ -x "/opt/homebrew/bin/code" ]]; then
+    echo "/opt/homebrew/bin/code"
+  else
+    echo "ERROR: 'code' command not found. Open VS Code -> Command Palette -> Shell Command: Install 'code' command in PATH" >&2
+    return 1
+  fi
+}
+
+tailscale_ip() {
+  if [[ -x "$TAILSCALE_BIN" ]]; then
+    "$TAILSCALE_BIN" ip -4 | head -1
+  elif command -v tailscale >/dev/null 2>&1; then
+    tailscale ip -4 | head -1
+  else
+    echo "ERROR: tailscale CLI not found" >&2
+    return 1
+  fi
+}
+
+url() {
+  local ip
+  ip="$(tailscale_ip)"
+  echo "http://${ip}:${PORT}"
+}
+
+port_pids() {
+  lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true
+}
+
+has_tmux_session() {
+  tmux has-session -t "$SESSION" 2>/dev/null
+}
+
+status_cmd() {
+  local u pids
+  u="$(url 2>/dev/null || true)"
+  pids="$(port_pids | tr '\n' ' ')"
+
+  echo "VS Code Web status"
+  echo "config:  $CONFIG_FILE"
+  echo "folder:  $DEFAULT_FOLDER"
+  echo "session: $SESSION"
+  echo "port:    $PORT"
+  [[ -n "$u" ]] && echo "url:     $u"
+
+  if has_tmux_session; then
+    echo "tmux:    running"
+  else
+    echo "tmux:    not running"
+  fi
+
+  if [[ -n "${pids// /}" ]]; then
+    echo "server:  running"
+    echo "pids:    $pids"
+    echo
+    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true
+  else
+    echo "server:  stopped"
+  fi
+
+  echo
+  echo "attach:  vscodeserver attach"
+  echo "stop:    vscodeserver stop"
+}
+
+run_foreground() {
+  local folder ip code
+  folder="${1:-$DEFAULT_FOLDER}"
+  ip="$(tailscale_ip)"
+  code="$(code_bin)"
+
+  echo "VS Code Web starting"
+  echo "Bound to Tailscale only: ${ip}:${PORT}"
+  echo "Open in browser: http://${ip}:${PORT}"
+  echo "Folder: $folder"
+  echo
+
+  exec "$code" serve-web \
+    --host "$ip" \
+    --port "$PORT" \
+    --without-connection-token \
+    --accept-server-license-terms \
+    --disable-telemetry \
+    --default-folder "$folder"
+}
+
+start_cmd() {
+  local folder script pids q_folder q_script
+  folder="${1:-$DEFAULT_FOLDER}"
+  script="$HOME/bin/vscodeserver"
+  if [[ ! -x "$script" ]]; then
+    script="$(command -v vscodeserver 2>/dev/null || true)"
+  fi
+  if [[ -z "$script" || ! -x "$script" ]]; then
+    echo "ERROR: cannot find vscodeserver script path" >&2
+    return 1
+  fi
+
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "ERROR: tmux not found" >&2
+    return 1
+  fi
+
+  pids="$(port_pids | tr '\n' ' ')"
+  if [[ -n "${pids// /}" ]]; then
+    echo "VS Code Web / port $PORT already appears to be running."
+    status_cmd
+    return 0
+  fi
+
+  if has_tmux_session; then
+    echo "tmux session '$SESSION' already exists. Not starting duplicate."
+    status_cmd
+    return 0
+  fi
+
+  q_folder="${folder:q}"
+  q_script="${script:q}"
+  tmux new-session -d -s "$SESSION" "VSCODE_SERVER_CONFIG=${CONFIG_FILE:q} VSCODE_SERVER_PORT=${PORT:q} VSCODE_SERVER_SESSION=${SESSION:q} $q_script run $q_folder"
+
+  sleep 2
+  echo "Started VS Code Web in tmux session '$SESSION'."
+  echo
+  status_cmd
+}
+
+stop_cmd() {
+  local pids pid cmd orphan_pids
+
+  if has_tmux_session; then
+    echo "Stopping tmux session '$SESSION'..."
+    tmux send-keys -t "$SESSION" C-c 2>/dev/null || true
+    sleep 1
+    if has_tmux_session; then
+      tmux kill-session -t "$SESSION" 2>/dev/null || true
+    fi
+  fi
+
+  pids="$(port_pids | tr '\n' ' ')"
+  if [[ -n "${pids// /}" ]]; then
+    echo "Stopping VS Code Web listener(s) on port $PORT: $pids"
+    for pid in ${(z)pids}; do
+      cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+      if [[ "$cmd" == *"code-tunnel serve-web"* || "$cmd" == *"cli.js serve-web"* || "$cmd" == *"code serve-web"* ]]; then
+        kill "$pid" 2>/dev/null || true
+      else
+        echo "Not killing non-VS-Code process on port $PORT: PID $pid"
+      fi
+    done
+    sleep 1
+  fi
+
+  orphan_pids="$(ps -axo pid,command | awk '/\.vscode\/cli\/serve-web\/.*(code-server|server-main\.js)/ && !/awk/ {print $1}' | tr '\n' ' ')"
+  if [[ -n "${orphan_pids// /}" ]]; then
+    echo "Stopping orphaned VS Code Web child process(es): $orphan_pids"
+    kill ${(z)orphan_pids} 2>/dev/null || true
+    sleep 1
+    orphan_pids="$(ps -axo pid,command | awk '/\.vscode\/cli\/serve-web\/.*(code-server|server-main\.js)/ && !/awk/ {print $1}' | tr '\n' ' ')"
+    if [[ -n "${orphan_pids// /}" ]]; then
+      echo "Force-stopping stubborn orphaned process(es): $orphan_pids"
+      kill -9 ${(z)orphan_pids} 2>/dev/null || true
+    fi
+  fi
+
+  echo "Stopped."
+}
+
+config_cmd() {
+  echo "config file: $CONFIG_FILE"
+  echo "effective DEFAULT_FOLDER=$DEFAULT_FOLDER"
+  echo "effective PORT=$PORT"
+  echo "effective SESSION=$SESSION"
+  echo "effective TAILSCALE_BIN=$TAILSCALE_BIN"
+  echo
+  if [[ -f "$CONFIG_FILE" ]]; then
+    cat "$CONFIG_FILE"
+  else
+    echo "No config file exists yet."
+  fi
+}
+
+case "${1:-help}" in
+  start) shift; start_cmd "$@" ;;
+  stop) shift; stop_cmd ;;
+  restart) shift; stop_cmd; start_cmd "$@" ;;
+  status) shift; status_cmd ;;
+  url) shift; url ;;
+  attach) shift; tmux attach -t "$SESSION" ;;
+  logs) shift; tmux capture-pane -p -t "$SESSION" -S -120 2>/dev/null || echo "No tmux session: $SESSION" ;;
+  run) shift; run_foreground "$@" ;;
+  config) shift; config_cmd ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac

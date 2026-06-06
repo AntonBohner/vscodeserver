@@ -1,0 +1,13 @@
+# vscodeserver user config
+# Install location: ~/.config/vscodeserver/config
+
+# Stable project entrypoint. Recommended: keep ~/dev as a symlink to wherever
+# the real dev folder lives.
+DEFAULT_FOLDER="$HOME/dev"
+
+# Default web server port and tmux session name.
+PORT=8001
+SESSION="vscode-server"
+
+# Tailscale macOS app CLI. Usually do not change.
+TAILSCALE_BIN="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
